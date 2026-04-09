@@ -68,50 +68,59 @@ app.get("/api/classes/:id/materials", async (c) => {
 
 app.post("/api/classes/:id/materials", async (c) => {
   const classId = c.req.param("id");
-  const body = await c.req.parseBody({ all: true });
+  const ct = c.req.header("content-type") || "";
 
-  const title = (body["title"] as string) || "Untitled";
-  let content = (body["content"] as string) || "";
-  let fileName = null;
-  const images: { name: string; type: string; data: string }[] = [];
+  let title = "Untitled";
+  let content = "";
+  let fileName: string | null = null;
+  let images: { name: string; type: string; data: string }[] = [];
 
-  // Handle file upload
-  const file = body["file"] as File | undefined;
-  if (file && file.size > 0) {
-    fileName = file.name;
-    const arrayBuffer = await file.arrayBuffer();
-    const uint8 = new Uint8Array(arrayBuffer);
-    const ext = file.name.toLowerCase().split('.').pop();
+  if (ct.includes("application/json")) {
+    // JSON body: images already processed client-side
+    const json = await c.req.json();
+    title = json.title || "Untitled";
+    content = json.content || "";
+    images = json.images || [];
+    fileName = json.file_name || null;
+  } else {
+    // FormData body (legacy / non-image uploads)
+    const body = await c.req.parseBody({ all: true });
+    title = (body["title"] as string) || "Untitled";
+    content = (body["content"] as string) || "";
 
-    if (['png', 'jpg', 'jpeg', 'gif', 'webp'].includes(ext || '')) {
-      // Store image as base64
-      const base64 = btoa(String.fromCharCode(...uint8));
-      const mimeType = ext === 'jpg' ? 'image/jpeg' : `image/${ext}`;
-      images.push({ name: file.name, type: mimeType, data: base64 });
-      if (!content) content = `[Image: ${file.name}]`;
-    } else {
-      content = await file.text();
+    const file = body["file"] as File | undefined;
+    if (file && file.size > 0) {
+      fileName = file.name;
+      const ext = file.name.toLowerCase().split('.').pop();
+      if (['png', 'jpg', 'jpeg', 'gif', 'webp'].includes(ext || '')) {
+        const buf = await file.arrayBuffer();
+        const base64 = btoa(String.fromCharCode(...new Uint8Array(buf)));
+        const mimeType = ext === 'jpg' ? 'image/jpeg' : `image/${ext}`;
+        images.push({ name: file.name, type: mimeType, data: base64 });
+        if (!content) content = `[Image: ${file.name}]`;
+      } else {
+        content = await file.text();
+      }
     }
-  }
 
-  // Handle multiple image uploads
-  const imageFiles = body["images"];
-  if (imageFiles) {
-    const fileList = Array.isArray(imageFiles) ? imageFiles : [imageFiles];
-    for (const img of fileList) {
-      if (img instanceof File && img.size > 0) {
-        const ext = img.name.toLowerCase().split('.').pop();
-        if (['png', 'jpg', 'jpeg', 'gif', 'webp'].includes(ext || '')) {
-          const buf = await img.arrayBuffer();
-          const base64 = btoa(String.fromCharCode(...new Uint8Array(buf)));
-          const mimeType = ext === 'jpg' ? 'image/jpeg' : `image/${ext}`;
-          images.push({ name: img.name, type: mimeType, data: base64 });
+    const imageFiles = body["images"];
+    if (imageFiles) {
+      const fileList = Array.isArray(imageFiles) ? imageFiles : [imageFiles];
+      for (const img of fileList) {
+        if (img instanceof File && img.size > 0) {
+          const ext = img.name.toLowerCase().split('.').pop();
+          if (['png', 'jpg', 'jpeg', 'gif', 'webp'].includes(ext || '')) {
+            const buf = await img.arrayBuffer();
+            const base64 = btoa(String.fromCharCode(...new Uint8Array(buf)));
+            const mimeType = ext === 'jpg' ? 'image/jpeg' : `image/${ext}`;
+            images.push({ name: img.name, type: mimeType, data: base64 });
+          }
         }
       }
     }
-    if (!content && images.length) content = `[${images.length} image(s) uploaded]`;
   }
 
+  if (!content && images.length) content = `[${images.length} image(s) uploaded]`;
   if (!String(content || "").trim() && images.length === 0) {
     return c.json({ error: "No content provided" }, 400);
   }
@@ -645,6 +654,40 @@ const HTML = `<!DOCTYPE html>
       return chunks;
     }
 
+    async function processImage(file, maxDim, quality) {
+      maxDim = maxDim || 1200; quality = quality || 0.7;
+      return new Promise(function(resolve) {
+        var reader = new FileReader();
+        reader.onload = function(e) {
+          var img = new Image();
+          img.onload = function() {
+            var w = img.width, h = img.height;
+            if (w > maxDim || h > maxDim) {
+              if (w > h) { h = Math.round(h * maxDim / w); w = maxDim; }
+              else { w = Math.round(w * maxDim / h); h = maxDim; }
+            }
+            var canvas = document.createElement('canvas');
+            canvas.width = w; canvas.height = h;
+            canvas.getContext('2d').drawImage(img, 0, 0, w, h);
+            var dataUrl = canvas.toDataURL('image/jpeg', quality);
+            var base64 = dataUrl.split(',')[1];
+            resolve({ name: file.name, type: 'image/jpeg', data: base64 });
+          };
+          img.src = e.target.result;
+        };
+        reader.readAsDataURL(file);
+      });
+    }
+
+    async function processImages(files, onProgress) {
+      var results = [];
+      for (var i = 0; i < files.length; i++) {
+        results.push(await processImage(files[i]));
+        if (onProgress) onProgress(i + 1, files.length);
+      }
+      return results;
+    }
+
     const API = '';
     let state = {
       classes: [], currentClass: null, currentTab: 'materials',
@@ -722,7 +765,6 @@ const HTML = `<!DOCTYPE html>
             const form = new FormData();
             form.append('title', chunkTitle);
             form.append('content', chunk.text);
-            if (images) { for (const img of images) form.append('images', img); }
             state.progressPct = Math.round(((i + 1) / chunks.length) * 100);
             state.loadingMsg = 'Uploading chunk ' + (i + 1) + ' of ' + chunks.length + '...';
             render();
@@ -737,12 +779,41 @@ const HTML = `<!DOCTYPE html>
         return;
       }
 
-      // Non-PDF upload
-      const form = new FormData();
+      // Collect all image files (from file input + images input)
+      var allImageFiles = [];
+      if (file && /\\.(png|jpe?g|gif|webp)$/i.test(file.name)) {
+        allImageFiles.push(file);
+        if (!content) content = '[Image: ' + file.name + ']';
+      }
+      if (images && images.length) {
+        for (var i = 0; i < images.length; i++) allImageFiles.push(images[i]);
+      }
+
+      // If we have images, process client-side and send as JSON
+      if (allImageFiles.length > 0) {
+        state.loadingMsg = 'Processing images...'; state.progressPct = 0; render();
+        var processed = await processImages(allImageFiles, function(done, total) {
+          state.progressPct = Math.round((done / total) * 100);
+          state.loadingMsg = 'Processing image ' + done + ' of ' + total + '...';
+          render();
+        });
+        if (!content && processed.length) content = '[' + processed.length + ' image(s) uploaded]';
+        state.loadingMsg = 'Uploading...'; state.progressPct = null; render();
+        await fetch(API + '/api/classes/' + state.currentClass.id + '/materials', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ title: baseTitle, content: content, images: processed }),
+        }).then(function(r) { return r.json(); });
+        state.loading = false; state.progressPct = null;
+        await loadClassData();
+        return;
+      }
+
+      // Text-only / non-image file upload
+      var form = new FormData();
       form.append('title', baseTitle);
       if (content) form.append('content', content);
       if (file) form.append('file', file);
-      if (images) { for (const img of images) form.append('images', img); }
 
       state.loadingMsg = 'Uploading...'; render();
       await api('/api/classes/' + state.currentClass.id + '/materials', { method: 'POST', body: form });
