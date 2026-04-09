@@ -595,6 +595,10 @@ const HTML = `<!DOCTYPE html>
     .plan-progress-bar { height: 100%; background: linear-gradient(90deg, var(--accent), var(--green)); border-radius: 3px; transition: width 0.3s; }
     .plan-tips { margin-top: 16px; padding: 16px; background: rgba(99,102,241,0.05); border-radius: 8px; border: 1px solid var(--border); }
     .plan-tips h4 { font-size: 14px; color: var(--accent2); margin-bottom: 8px; }
+    .upload-progress { width: 100%; margin: 12px 0; }
+    .upload-progress-bar { height: 8px; background: var(--surface2); border-radius: 4px; overflow: hidden; }
+    .upload-progress-fill { height: 100%; background: linear-gradient(90deg, var(--accent), var(--green)); border-radius: 4px; transition: width 0.2s; }
+    .upload-progress-text { font-size: 12px; color: var(--text2); margin-top: 4px; }
     .plan-tips li { font-size: 13px; color: var(--text2); margin-bottom: 4px; }
     @media (max-width: 768px) {
       .sidebar { width: 100%; position: relative; border-right: none; border-bottom: 1px solid var(--border); }
@@ -609,19 +613,37 @@ const HTML = `<!DOCTYPE html>
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.0.379/pdf.min.mjs" type="module"></script>
   <script>
-    // PDF text extraction (client-side)
-    async function extractPdfText(file) {
+    // PDF text extraction (client-side) with progress + chunking
+    async function extractPdfPages(file, onProgress) {
       const pdfjsLib = await import('https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.0.379/pdf.min.mjs');
       pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.0.379/pdf.worker.min.mjs';
       const arrayBuffer = await file.arrayBuffer();
       const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
-      let text = '';
+      const pages = [];
       for (let i = 1; i <= pdf.numPages; i++) {
         const page = await pdf.getPage(i);
         const content = await page.getTextContent();
-        text += content.items.map(item => item.str).join(' ') + '\\n';
+        pages.push(content.items.map(item => item.str).join(' '));
+        if (onProgress) onProgress(i, pdf.numPages);
       }
-      return text;
+      return pages;
+    }
+
+    function chunkPages(pages, maxChars) {
+      const chunks = [];
+      let current = []; let currentLen = 0; let startPage = 1;
+      for (let i = 0; i < pages.length; i++) {
+        const pageLen = pages[i].length;
+        if (currentLen + pageLen > maxChars && current.length > 0) {
+          chunks.push({ text: current.join('\n'), startPage, endPage: i });
+          current = []; currentLen = 0; startPage = i + 1;
+        }
+        current.push(pages[i]); currentLen += pageLen;
+      }
+      if (current.length > 0) {
+        chunks.push({ text: current.join('\n'), startPage, endPage: pages.length });
+      }
+      return chunks;
     }
   </script>
   <script>
@@ -631,7 +653,7 @@ const HTML = `<!DOCTYPE html>
       materials: [], questions: [], studyGuides: [], plans: [],
       quizQuestions: null, quizType: null, quizAnswers: {}, quizSubmitted: false, quizGrades: {},
       viewingGuide: null, viewingPlan: null,
-      loading: false, loadingMsg: '',
+      loading: false, loadingMsg: '', progressPct: null,
     };
 
     async function api(path, opts = {}) { const res = await fetch(API + path, opts); return res.json(); }
@@ -680,28 +702,53 @@ const HTML = `<!DOCTYPE html>
         alert('Please provide a title and content, a file, or images'); return;
       }
 
-      state.loading = true; state.loadingMsg = 'Processing...'; render();
+      state.loading = true; state.progressPct = null; state.loadingMsg = 'Processing...'; render();
+      const baseTitle = title || (file ? file.name.replace(/\\.pdf$/i, '') : (images?.length ? 'Image Upload' : 'Untitled'));
 
-      // Extract PDF text client-side
-      let fileToUpload = file;
+      // Handle PDF with chunked upload
       if (file && file.name.toLowerCase().endsWith('.pdf')) {
-        state.loadingMsg = 'Extracting text from PDF...'; render();
         try {
-          const pdfText = await extractPdfText(file);
-          content = pdfText;
-          fileToUpload = null; // Don't send the PDF file, just the text
-        } catch(e) { console.error('PDF extraction failed:', e); }
+          state.loadingMsg = 'Extracting text from PDF...'; state.progressPct = 0; render();
+          const pages = await extractPdfPages(file, (current, total) => {
+            state.progressPct = Math.round((current / total) * 100);
+            state.loadingMsg = 'Extracting page ' + current + ' of ' + total + '...';
+            render();
+          });
+
+          const chunks = chunkPages(pages, 50000);
+          state.loadingMsg = 'Uploading...'; state.progressPct = 0; render();
+
+          for (let i = 0; i < chunks.length; i++) {
+            const chunk = chunks[i];
+            const chunkTitle = chunks.length === 1 ? baseTitle : baseTitle + ' (Pages ' + chunk.startPage + '-' + chunk.endPage + ')';
+            const form = new FormData();
+            form.append('title', chunkTitle);
+            form.append('content', chunk.text);
+            if (images) { for (const img of images) form.append('images', img); }
+            state.progressPct = Math.round(((i + 1) / chunks.length) * 100);
+            state.loadingMsg = 'Uploading chunk ' + (i + 1) + ' of ' + chunks.length + '...';
+            render();
+            await api('/api/classes/' + state.currentClass.id + '/materials', { method: 'POST', body: form });
+          }
+        } catch(e) {
+          console.error('PDF extraction failed:', e);
+          alert('PDF extraction failed: ' + e.message);
+        }
+        state.loading = false; state.progressPct = null;
+        await loadClassData();
+        return;
       }
 
+      // Non-PDF upload
       const form = new FormData();
-      form.append('title', title || (file ? file.name : (images?.length ? 'Image Upload' : 'Untitled')));
+      form.append('title', baseTitle);
       if (content) form.append('content', content);
-      if (fileToUpload) form.append('file', fileToUpload);
+      if (file) form.append('file', file);
       if (images) { for (const img of images) form.append('images', img); }
 
       state.loadingMsg = 'Uploading...'; render();
       await api('/api/classes/' + state.currentClass.id + '/materials', { method: 'POST', body: form });
-      state.loading = false;
+      state.loading = false; state.progressPct = null;
       await loadClassData();
     }
 
@@ -841,7 +888,7 @@ const HTML = `<!DOCTYPE html>
         '<div class="tabs">' + tabs.map(t =>
           '<button class="tab ' + (state.currentTab === t ? 'active' : '') + '" data-tab="' + t + '">' + tabLabels[t] + '</button>'
         ).join('') + '</div>' +
-        (state.loading ? '<div class="loading"><div class="spinner"></div>' + state.loadingMsg + '</div>' : renderTabContent()) +
+        (state.loading ? '<div class="loading"><div class="spinner"></div>' + state.loadingMsg + (state.progressPct != null ? '<div class="upload-progress"><div class="upload-progress-bar"><div class="upload-progress-fill" style="width:' + state.progressPct + '%"></div></div><div class="upload-progress-text">' + state.progressPct + '%</div></div>' : '') + '</div>' : renderTabContent()) +
         '</div>';
     }
 
