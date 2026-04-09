@@ -470,8 +470,11 @@ app.delete("/api/study-guides/:classId/:id", async (c) => {
   return c.json({ ok: true });
 });
 
-// --- Serve HTML ---
+// --- Serve HTML (only for non-API routes) ---
 app.get("*", (c) => {
+  if (c.req.path.startsWith("/api/")) {
+    return c.json({ error: "Not found" }, 404);
+  }
   return c.html(HTML);
 });
 
