@@ -8,6 +8,12 @@ const kv = await Deno.openKv();
 
 app.use("/*", cors());
 
+// Global error handler
+app.onError((err, c) => {
+  console.error("Server error:", err.message, err.stack);
+  return c.json({ error: err.message }, 500);
+});
+
 // --- Seed classes on first run ---
 const CLASSES = [
   { id: "1", name: "AP Calculus BC", short_name: "Calc BC", color: "#6366f1" },
