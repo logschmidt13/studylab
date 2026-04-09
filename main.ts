@@ -47,44 +47,82 @@ app.get("/api/classes/:id", async (c) => {
   return c.json(cls.value);
 });
 
-// --- API: Materials ---
+// --- API: Materials (now with image support) ---
 app.get("/api/classes/:id/materials", async (c) => {
   const materials = await kvList(["materials", c.req.param("id")]);
-  materials.sort((a: any, b: any) => (b.created_at || "").localeCompare(a.created_at || ""));
-  return c.json(materials);
+  // Don't send full image data in list view
+  const slim = (materials as any[]).map(m => ({
+    ...m,
+    images: m.images ? m.images.map((img: any) => ({ name: img.name, type: img.type })) : [],
+    content: m.content ? m.content.substring(0, 200) + (m.content.length > 200 ? '...' : '') : '',
+  }));
+  slim.sort((a: any, b: any) => (b.created_at || "").localeCompare(a.created_at || ""));
+  return c.json(slim);
 });
 
 app.post("/api/classes/:id/materials", async (c) => {
   const classId = c.req.param("id");
-  const body = await c.req.parseBody();
+  const body = await c.req.parseBody({ all: true });
 
-  const file = body["file"] as File | undefined;
   const title = (body["title"] as string) || "Untitled";
   let content = (body["content"] as string) || "";
   let fileName = null;
+  const images: { name: string; type: string; data: string }[] = [];
 
+  // Handle file upload
+  const file = body["file"] as File | undefined;
   if (file && file.size > 0) {
     fileName = file.name;
     const arrayBuffer = await file.arrayBuffer();
     const uint8 = new Uint8Array(arrayBuffer);
+    const ext = file.name.toLowerCase().split('.').pop();
 
-    if (file.name.toLowerCase().endsWith('.pdf')) {
+    if (ext === 'pdf') {
       const result = await extractText(uint8);
       content = String(result.text || "");
+    } else if (['png', 'jpg', 'jpeg', 'gif', 'webp'].includes(ext || '')) {
+      // Store image as base64
+      const base64 = btoa(String.fromCharCode(...uint8));
+      const mimeType = ext === 'jpg' ? 'image/jpeg' : `image/${ext}`;
+      images.push({ name: file.name, type: mimeType, data: base64 });
+      if (!content) content = `[Image: ${file.name}]`;
     } else {
       content = await file.text();
     }
   }
 
-  if (!String(content || "").trim()) {
+  // Handle multiple image uploads
+  const imageFiles = body["images"];
+  if (imageFiles) {
+    const fileList = Array.isArray(imageFiles) ? imageFiles : [imageFiles];
+    for (const img of fileList) {
+      if (img instanceof File && img.size > 0) {
+        const ext = img.name.toLowerCase().split('.').pop();
+        if (['png', 'jpg', 'jpeg', 'gif', 'webp'].includes(ext || '')) {
+          const buf = await img.arrayBuffer();
+          const base64 = btoa(String.fromCharCode(...new Uint8Array(buf)));
+          const mimeType = ext === 'jpg' ? 'image/jpeg' : `image/${ext}`;
+          images.push({ name: img.name, type: mimeType, data: base64 });
+        }
+      }
+    }
+    if (!content && images.length) content = `[${images.length} image(s) uploaded]`;
+  }
+
+  if (!String(content || "").trim() && images.length === 0) {
     return c.json({ error: "No content provided" }, 400);
   }
 
   const id = genId();
-  const material = { id, class_id: classId, title, content, file_name: fileName, created_at: new Date().toISOString() };
+  const material = {
+    id, class_id: classId, title, content,
+    file_name: fileName, images,
+    has_images: images.length > 0,
+    created_at: new Date().toISOString(),
+  };
   await kv.set(["materials", classId, id], material);
 
-  return c.json({ id, title, file_name: fileName }, 201);
+  return c.json({ id, title, file_name: fileName, has_images: images.length > 0 }, 201);
 });
 
 app.delete("/api/materials/:classId/:id", async (c) => {
@@ -99,12 +137,43 @@ function getClient(): Anthropic {
   return new Anthropic({ apiKey });
 }
 
-async function getMaterials(classId: string, materialIds?: string[]) {
-  const all = await kvList<{ id: string; title: string; content: string }>(["materials", classId]);
+async function getMaterialsFull(classId: string, materialIds?: string[]) {
+  const all = await kvList<any>(["materials", classId]);
   if (materialIds && materialIds.length > 0) {
     return all.filter(m => materialIds.includes(m.id));
   }
   return all;
+}
+
+// Build Claude message content with text + images
+function buildMaterialContent(materials: any[], prompt: string): any[] {
+  const contentParts: any[] = [];
+
+  // Add images from materials
+  for (const m of materials) {
+    if (m.images && m.images.length > 0) {
+      for (const img of m.images) {
+        contentParts.push({
+          type: "image",
+          source: { type: "base64", media_type: img.type, data: img.data },
+        });
+        contentParts.push({
+          type: "text",
+          text: `[Image from material: ${m.title} - ${img.name}]`,
+        });
+      }
+    }
+  }
+
+  // Add text content
+  const materialText = materials
+    .filter(m => m.content && !m.content.startsWith('[Image:') && !m.content.startsWith('['))
+    .map(m => `--- ${m.title} ---\n${m.content}`)
+    .join("\n\n");
+
+  contentParts.push({ type: "text", text: prompt + (materialText ? `\n\nMATERIALS:\n${materialText}` : '') });
+
+  return contentParts;
 }
 
 app.post("/api/classes/:id/generate/mcq", async (c) => {
@@ -112,24 +181,15 @@ app.post("/api/classes/:id/generate/mcq", async (c) => {
   const { count = 5, materialIds } = await c.req.json();
 
   const cls = (await kv.get(["classes", classId])).value as { name: string };
-  const materials = await getMaterials(classId, materialIds);
+  const materials = await getMaterialsFull(classId, materialIds);
 
   if (materials.length === 0) {
     return c.json({ error: "No materials uploaded for this class yet" }, 400);
   }
 
   const client = getClient();
-  const materialText = materials.map(m => `--- ${m.title} ---\n${m.content}`).join("\n\n");
-
-  const msg = await client.messages.create({
-    model: "claude-sonnet-4-20250514",
-    max_tokens: 4096,
-    messages: [{
-      role: "user",
-      content: `You are a study assistant for a high school student in ${cls.name}. Based on the following study materials, generate ${count} multiple choice questions.
-
-MATERIALS:
-${materialText}
+  const content = buildMaterialContent(materials,
+    `You are a study assistant for a high school student in ${cls.name}. Based on the following study materials (including any images), generate ${count} multiple choice questions.
 
 Return ONLY a JSON array with this exact format (no markdown, no code fences):
 [
@@ -139,20 +199,19 @@ Return ONLY a JSON array with this exact format (no markdown, no code fences):
     "answer": "A",
     "explanation": "Brief explanation of why this is correct"
   }
-]`
-    }]
+]`);
+
+  const msg = await client.messages.create({
+    model: "claude-sonnet-4-20250514",
+    max_tokens: 4096,
+    messages: [{ role: "user", content }],
   });
 
   const text = msg.content[0].type === "text" ? msg.content[0].text : "";
   let questions;
-  try {
-    questions = JSON.parse(text);
-  } catch {
-    const match = text.match(/\[[\s\S]*\]/);
-    questions = match ? JSON.parse(match[0]) : [];
-  }
+  try { questions = JSON.parse(text); }
+  catch { const match = text.match(/\[[\s\S]*\]/); questions = match ? JSON.parse(match[0]) : []; }
 
-  // Save to KV
   const ids: string[] = [];
   for (const q of questions) {
     const id = genId();
@@ -163,7 +222,6 @@ Return ONLY a JSON array with this exact format (no markdown, no code fences):
       explanation: q.explanation || "", created_at: new Date().toISOString(),
     });
   }
-
   return c.json({ questions, ids });
 });
 
@@ -172,24 +230,15 @@ app.post("/api/classes/:id/generate/frq", async (c) => {
   const { count = 3, materialIds } = await c.req.json();
 
   const cls = (await kv.get(["classes", classId])).value as { name: string };
-  const materials = await getMaterials(classId, materialIds);
+  const materials = await getMaterialsFull(classId, materialIds);
 
   if (materials.length === 0) {
     return c.json({ error: "No materials uploaded for this class yet" }, 400);
   }
 
   const client = getClient();
-  const materialText = materials.map(m => `--- ${m.title} ---\n${m.content}`).join("\n\n");
-
-  const msg = await client.messages.create({
-    model: "claude-sonnet-4-20250514",
-    max_tokens: 4096,
-    messages: [{
-      role: "user",
-      content: `You are a study assistant for a high school student in ${cls.name}. Based on the following study materials, generate ${count} free response questions that would appear on an AP exam or college-level assessment.
-
-MATERIALS:
-${materialText}
+  const content = buildMaterialContent(materials,
+    `You are a study assistant for a high school student in ${cls.name}. Based on the following study materials (including any images), generate ${count} free response questions that would appear on an AP exam or college-level assessment.
 
 Return ONLY a JSON array with this exact format (no markdown, no code fences):
 [
@@ -198,18 +247,18 @@ Return ONLY a JSON array with this exact format (no markdown, no code fences):
     "answer": "A thorough model answer that would receive full marks",
     "explanation": "Key points the grader would look for"
   }
-]`
-    }]
+]`);
+
+  const msg = await client.messages.create({
+    model: "claude-sonnet-4-20250514",
+    max_tokens: 4096,
+    messages: [{ role: "user", content }],
   });
 
   const text = msg.content[0].type === "text" ? msg.content[0].text : "";
   let questions;
-  try {
-    questions = JSON.parse(text);
-  } catch {
-    const match = text.match(/\[[\s\S]*\]/);
-    questions = match ? JSON.parse(match[0]) : [];
-  }
+  try { questions = JSON.parse(text); }
+  catch { const match = text.match(/\[[\s\S]*\]/); questions = match ? JSON.parse(match[0]) : []; }
 
   const ids: string[] = [];
   for (const q of questions) {
@@ -221,7 +270,6 @@ Return ONLY a JSON array with this exact format (no markdown, no code fences):
       explanation: q.explanation || "", created_at: new Date().toISOString(),
     });
   }
-
   return c.json({ questions, ids });
 });
 
@@ -230,25 +278,16 @@ app.post("/api/classes/:id/generate/study-guide", async (c) => {
   const { materialIds, topic } = await c.req.json();
 
   const cls = (await kv.get(["classes", classId])).value as { name: string };
-  const materials = await getMaterials(classId, materialIds);
+  const materials = await getMaterialsFull(classId, materialIds);
 
   if (materials.length === 0) {
     return c.json({ error: "No materials uploaded for this class yet" }, 400);
   }
 
   const client = getClient();
-  const materialText = materials.map(m => `--- ${m.title} ---\n${m.content}`).join("\n\n");
   const topicLine = topic ? `Focus on the topic: ${topic}` : "Cover the key concepts from the materials.";
-
-  const msg = await client.messages.create({
-    model: "claude-sonnet-4-20250514",
-    max_tokens: 8192,
-    messages: [{
-      role: "user",
-      content: `You are a study assistant for a high school student in ${cls.name}. Create a comprehensive study guide based on the following materials. ${topicLine}
-
-MATERIALS:
-${materialText}
+  const content = buildMaterialContent(materials,
+    `You are a study assistant for a high school student in ${cls.name}. Create a comprehensive study guide based on the following materials (including any images). ${topicLine}
 
 Format the study guide in clean markdown with:
 - A clear title
@@ -258,19 +297,23 @@ Format the study guide in clean markdown with:
 - Practice tips
 - Summary
 
-Make it easy to scan and review.`
-    }]
+Make it easy to scan and review.`);
+
+  const msg = await client.messages.create({
+    model: "claude-sonnet-4-20250514",
+    max_tokens: 8192,
+    messages: [{ role: "user", content }],
   });
 
-  const content = msg.content[0].type === "text" ? msg.content[0].text : "";
+  const guideContent = msg.content[0].type === "text" ? msg.content[0].text : "";
   const title = topic || `Study Guide - ${new Date().toLocaleDateString()}`;
   const id = genId();
 
   await kv.set(["study_guides", classId, id], {
-    id, class_id: classId, title, content, created_at: new Date().toISOString(),
+    id, class_id: classId, title, content: guideContent, created_at: new Date().toISOString(),
   });
 
-  return c.json({ id, title, content });
+  return c.json({ id, title, content: guideContent });
 });
 
 // Grade FRQ answer
@@ -302,13 +345,98 @@ Grade the student's answer. Return ONLY JSON (no markdown, no code fences):
 
   const text = msg.content[0].type === "text" ? msg.content[0].text : "";
   let result;
-  try {
-    result = JSON.parse(text);
-  } catch {
-    const match = text.match(/\{[\s\S]*\}/);
-    result = match ? JSON.parse(match[0]) : { score: 0, feedback: "Could not parse response", suggestions: "" };
-  }
+  try { result = JSON.parse(text); }
+  catch { const match = text.match(/\{[\s\S]*\}/); result = match ? JSON.parse(match[0]) : { score: 0, feedback: "Could not parse response", suggestions: "" }; }
   return c.json(result);
+});
+
+// --- API: Study Plans ---
+app.get("/api/classes/:id/plans", async (c) => {
+  const plans = await kvList(["plans", c.req.param("id")]);
+  plans.sort((a: any, b: any) => (b.created_at || "").localeCompare(a.created_at || ""));
+  return c.json(plans);
+});
+
+app.post("/api/classes/:id/plans", async (c) => {
+  const classId = c.req.param("id");
+  const { goal, duration, examDate } = await c.req.json();
+
+  const cls = (await kv.get(["classes", classId])).value as { name: string };
+  const materials = await getMaterialsFull(classId);
+
+  const client = getClient();
+  const materialSummary = materials.length > 0
+    ? `The student has uploaded these materials: ${materials.map(m => m.title).join(", ")}`
+    : "The student has not uploaded specific materials yet.";
+
+  const msg = await client.messages.create({
+    model: "claude-sonnet-4-20250514",
+    max_tokens: 4096,
+    messages: [{
+      role: "user",
+      content: `You are a study planner for a high school student in ${cls.name}.
+
+GOAL: ${goal}
+STUDY DURATION: ${duration}
+${examDate ? `EXAM/DUE DATE: ${examDate}` : ''}
+${materialSummary}
+
+Create a detailed study plan. Return ONLY JSON (no markdown, no code fences):
+{
+  "title": "Short plan title",
+  "summary": "Brief overview of the plan approach",
+  "steps": [
+    {
+      "day": "Day 1" or "Session 1",
+      "title": "Step title",
+      "description": "What to do in detail",
+      "duration": "Estimated time like 30 min, 1 hour",
+      "type": "review|practice|memorize|apply|rest"
+    }
+  ],
+  "tips": ["Helpful tip 1", "Helpful tip 2"]
+}`
+    }]
+  });
+
+  const text = msg.content[0].type === "text" ? msg.content[0].text : "";
+  let plan;
+  try { plan = JSON.parse(text); }
+  catch { const match = text.match(/\{[\s\S]*\}/); plan = match ? JSON.parse(match[0]) : { title: "Study Plan", summary: "", steps: [], tips: [] }; }
+
+  const id = genId();
+  const steps = (plan.steps || []).map((s: any, i: number) => ({ ...s, id: i, completed: false }));
+
+  const planData = {
+    id, class_id: classId,
+    title: plan.title, summary: plan.summary,
+    goal, duration, exam_date: examDate || null,
+    steps, tips: plan.tips || [],
+    created_at: new Date().toISOString(),
+  };
+
+  await kv.set(["plans", classId, id], planData);
+  return c.json(planData);
+});
+
+app.put("/api/plans/:classId/:id/step/:stepId", async (c) => {
+  const { classId, id, stepId } = c.req.param();
+  const { completed } = await c.req.json();
+
+  const entry = await kv.get(["plans", classId, id]);
+  if (!entry.value) return c.json({ error: "Plan not found" }, 404);
+
+  const plan = entry.value as any;
+  const step = plan.steps.find((s: any) => s.id === parseInt(stepId));
+  if (step) step.completed = completed;
+
+  await kv.set(["plans", classId, id], plan);
+  return c.json({ ok: true });
+});
+
+app.delete("/api/plans/:classId/:id", async (c) => {
+  await kv.delete(["plans", c.req.param("classId"), c.req.param("id")]);
+  return c.json({ ok: true });
 });
 
 // --- API: Saved questions & guides ---
@@ -369,7 +497,7 @@ const HTML = `<!DOCTYPE html>
     .class-item:hover, .class-item.active { background: var(--surface2); }
     .class-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
     .main { margin-left: 260px; flex: 1; padding: 32px 40px; max-width: 960px; }
-    .tabs { display: flex; gap: 4px; background: var(--surface); border-radius: 10px; padding: 4px; margin-bottom: 28px; }
+    .tabs { display: flex; gap: 4px; background: var(--surface); border-radius: 10px; padding: 4px; margin-bottom: 28px; flex-wrap: wrap; }
     .tab { padding: 8px 18px; border-radius: 8px; cursor: pointer; font-size: 14px; font-weight: 500; color: var(--text2); border: none; background: none; transition: all 0.15s; }
     .tab:hover { color: var(--text); }
     .tab.active { background: var(--accent); color: white; }
@@ -379,12 +507,13 @@ const HTML = `<!DOCTYPE html>
     .btn { padding: 10px 20px; border-radius: 8px; border: none; font-size: 14px; font-weight: 600; cursor: pointer; transition: all 0.15s; display: inline-flex; align-items: center; gap: 8px; }
     .btn-primary { background: var(--accent); color: white; }
     .btn-primary:hover { background: var(--accent2); }
-    .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
     .btn-secondary { background: var(--surface2); color: var(--text); border: 1px solid var(--border); }
     .btn-secondary:hover { border-color: var(--accent); }
     .btn-danger { background: transparent; color: var(--red); border: 1px solid var(--red); padding: 6px 12px; font-size: 12px; }
     .btn-danger:hover { background: var(--red); color: white; }
     .btn-sm { padding: 6px 14px; font-size: 13px; }
+    .btn-success { background: var(--green); color: white; }
+    .btn-success:hover { opacity: 0.9; }
     input, textarea, select { background: var(--surface2); border: 1px solid var(--border); border-radius: 8px; padding: 10px 14px; color: var(--text); font-size: 14px; width: 100%; font-family: inherit; }
     input:focus, textarea:focus, select:focus { outline: none; border-color: var(--accent); }
     textarea { resize: vertical; min-height: 100px; }
@@ -425,6 +554,7 @@ const HTML = `<!DOCTYPE html>
     .badge { display: inline-block; padding: 3px 10px; border-radius: 20px; font-size: 11px; font-weight: 600; text-transform: uppercase; }
     .badge-mcq { background: rgba(99, 102, 241, 0.15); color: var(--accent2); }
     .badge-frq { background: rgba(245, 158, 11, 0.15); color: var(--yellow); }
+    .badge-img { background: rgba(236, 72, 153, 0.15); color: #ec4899; }
     .gen-row { display: flex; gap: 12px; flex-wrap: wrap; align-items: end; }
     .gen-row .form-group { margin-bottom: 0; flex: 1; min-width: 120px; }
     .empty { text-align: center; padding: 48px 24px; color: var(--text2); }
@@ -438,6 +568,28 @@ const HTML = `<!DOCTYPE html>
     .material-check { display: flex; align-items: center; gap: 10px; padding: 10px 14px; background: var(--surface2); border-radius: 8px; margin-bottom: 6px; cursor: pointer; }
     .material-check:hover { background: var(--border); }
     .material-check input[type="checkbox"] { width: auto; accent-color: var(--accent); }
+    /* Study Plan styles */
+    .plan-step { display: flex; gap: 14px; padding: 16px; background: var(--surface2); border-radius: 8px; margin-bottom: 8px; align-items: flex-start; border-left: 3px solid var(--border); transition: all 0.2s; }
+    .plan-step.completed { border-left-color: var(--green); opacity: 0.7; }
+    .plan-step .step-check { width: 22px; height: 22px; border-radius: 50%; border: 2px solid var(--border); cursor: pointer; flex-shrink: 0; display: flex; align-items: center; justify-content: center; margin-top: 2px; transition: all 0.15s; }
+    .plan-step .step-check:hover { border-color: var(--green); }
+    .plan-step.completed .step-check { background: var(--green); border-color: var(--green); }
+    .plan-step .step-body { flex: 1; }
+    .plan-step .step-day { font-size: 11px; color: var(--accent2); font-weight: 600; text-transform: uppercase; }
+    .plan-step .step-title { font-weight: 600; font-size: 15px; margin: 4px 0; }
+    .plan-step .step-desc { font-size: 13px; color: var(--text2); line-height: 1.5; }
+    .plan-step .step-dur { font-size: 12px; color: var(--text2); margin-top: 6px; display: inline-flex; align-items: center; gap: 4px; background: var(--surface); padding: 2px 8px; border-radius: 4px; }
+    .plan-step .step-type { font-size: 11px; padding: 2px 8px; border-radius: 4px; margin-left: 6px; font-weight: 600; text-transform: uppercase; }
+    .type-review { background: rgba(99,102,241,0.15); color: var(--accent2); }
+    .type-practice { background: rgba(16,185,129,0.15); color: var(--green); }
+    .type-memorize { background: rgba(245,158,11,0.15); color: var(--yellow); }
+    .type-apply { background: rgba(236,72,153,0.15); color: #ec4899; }
+    .type-rest { background: rgba(148,148,168,0.15); color: var(--text2); }
+    .plan-progress { height: 6px; background: var(--surface2); border-radius: 3px; margin: 12px 0; overflow: hidden; }
+    .plan-progress-bar { height: 100%; background: linear-gradient(90deg, var(--accent), var(--green)); border-radius: 3px; transition: width 0.3s; }
+    .plan-tips { margin-top: 16px; padding: 16px; background: rgba(99,102,241,0.05); border-radius: 8px; border: 1px solid var(--border); }
+    .plan-tips h4 { font-size: 14px; color: var(--accent2); margin-bottom: 8px; }
+    .plan-tips li { font-size: 13px; color: var(--text2); margin-bottom: 4px; }
     @media (max-width: 768px) {
       .sidebar { width: 100%; position: relative; border-right: none; border-bottom: 1px solid var(--border); }
       .main { margin-left: 0; padding: 20px; }
@@ -453,15 +605,13 @@ const HTML = `<!DOCTYPE html>
     const API = '';
     let state = {
       classes: [], currentClass: null, currentTab: 'materials',
-      materials: [], questions: [], studyGuides: [],
+      materials: [], questions: [], studyGuides: [], plans: [],
       quizQuestions: null, quizType: null, quizAnswers: {}, quizSubmitted: false, quizGrades: {},
-      viewingGuide: null, loading: false, loadingMsg: '',
+      viewingGuide: null, viewingPlan: null,
+      loading: false, loadingMsg: '',
     };
 
-    async function api(path, opts = {}) {
-      const res = await fetch(API + path, opts);
-      return res.json();
-    }
+    async function api(path, opts = {}) { const res = await fetch(API + path, opts); return res.json(); }
 
     async function loadClasses() {
       state.classes = await api('/api/classes');
@@ -472,37 +622,47 @@ const HTML = `<!DOCTYPE html>
     async function loadClassData() {
       if (!state.currentClass) return;
       const id = state.currentClass.id;
-      const [materials, questions, guides] = await Promise.all([
+      const [materials, questions, guides, plans] = await Promise.all([
         api('/api/classes/' + id + '/materials'),
         api('/api/classes/' + id + '/questions'),
         api('/api/classes/' + id + '/study-guides'),
+        api('/api/classes/' + id + '/plans'),
       ]);
       state.materials = materials;
       state.questions = questions;
       state.studyGuides = guides;
+      state.plans = plans;
       render();
     }
 
     function selectClass(cls) {
       state.currentClass = cls; state.currentTab = 'materials';
-      state.quizQuestions = null; state.viewingGuide = null;
+      state.quizQuestions = null; state.viewingGuide = null; state.viewingPlan = null;
       loadClassData();
     }
 
     function selectTab(tab) {
-      state.currentTab = tab; state.quizQuestions = null; state.viewingGuide = null; render();
+      state.currentTab = tab; state.quizQuestions = null; state.viewingGuide = null; state.viewingPlan = null; render();
     }
 
     async function uploadMaterial() {
       const title = document.getElementById('mat-title').value.trim();
       const content = document.getElementById('mat-content').value.trim();
       const fileInput = document.getElementById('mat-file');
+      const imageInput = document.getElementById('mat-images');
       const file = fileInput?.files?.[0];
-      if (!title && !file && !content) { alert('Please provide a title and content or a file'); return; }
+      const images = imageInput?.files;
+
+      if (!title && !file && !content && (!images || images.length === 0)) {
+        alert('Please provide a title and content, a file, or images'); return;
+      }
+
       const form = new FormData();
-      form.append('title', title || (file ? file.name : 'Untitled'));
+      form.append('title', title || (file ? file.name : (images?.length ? 'Image Upload' : 'Untitled')));
       if (content) form.append('content', content);
       if (file) form.append('file', file);
+      if (images) { for (const img of images) form.append('images', img); }
+
       state.loading = true; state.loadingMsg = 'Uploading...'; render();
       await api('/api/classes/' + state.currentClass.id + '/materials', { method: 'POST', body: form });
       state.loading = false;
@@ -558,6 +718,46 @@ const HTML = `<!DOCTYPE html>
       await loadClassData();
     }
 
+    async function createPlan() {
+      const goal = document.getElementById('plan-goal')?.value?.trim();
+      const duration = document.getElementById('plan-duration')?.value?.trim();
+      const examDate = document.getElementById('plan-exam')?.value?.trim();
+      if (!goal || !duration) { alert('Please enter a study goal and duration'); return; }
+      state.loading = true; state.loadingMsg = 'Creating your study plan...'; render();
+      const data = await api('/api/classes/' + state.currentClass.id + '/plans', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ goal, duration, examDate }),
+      });
+      state.loading = false;
+      if (data.error) { alert(data.error); render(); return; }
+      state.viewingPlan = data;
+      await loadClassData();
+    }
+
+    async function toggleStep(planId, stepId, completed) {
+      await api('/api/plans/' + state.currentClass.id + '/' + planId + '/step/' + stepId, {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ completed }),
+      });
+      // Update local state
+      if (state.viewingPlan && state.viewingPlan.id === planId) {
+        const step = state.viewingPlan.steps.find(s => s.id === stepId);
+        if (step) step.completed = completed;
+      }
+      const plan = state.plans.find(p => p.id === planId);
+      if (plan && plan.steps) {
+        const step = plan.steps.find(s => s.id === stepId);
+        if (step) step.completed = completed;
+      }
+      render();
+    }
+
+    async function deletePlan(id) {
+      await api('/api/plans/' + state.currentClass.id + '/' + id, { method: 'DELETE' });
+      state.viewingPlan = null;
+      loadClassData();
+    }
+
     function getSelectedMaterials() {
       return Array.from(document.querySelectorAll('.mat-select:checked')).map(c => c.value);
     }
@@ -576,17 +776,10 @@ const HTML = `<!DOCTYPE html>
       state.loading = false; state.quizGrades[index] = result; render();
     }
 
-    async function deleteQuestion(id) {
-      await api('/api/questions/' + state.currentClass.id + '/' + id, { method: 'DELETE' });
-      loadClassData();
-    }
-
-    async function deleteGuide(id) {
-      await api('/api/study-guides/' + state.currentClass.id + '/' + id, { method: 'DELETE' });
-      loadClassData();
-    }
-
+    async function deleteQuestion(id) { await api('/api/questions/' + state.currentClass.id + '/' + id, { method: 'DELETE' }); loadClassData(); }
+    async function deleteGuide(id) { await api('/api/study-guides/' + state.currentClass.id + '/' + id, { method: 'DELETE' }); loadClassData(); }
     function viewGuide(guide) { state.viewingGuide = guide; render(); }
+    function viewPlan(plan) { state.viewingPlan = plan; render(); }
 
     function render() {
       document.getElementById('app').innerHTML = renderSidebar() + renderMain();
@@ -604,12 +797,13 @@ const HTML = `<!DOCTYPE html>
     function renderMain() {
       if (!state.currentClass) return '<div class="main"><div class="empty"><p>Select a class</p></div></div>';
       const cls = state.currentClass;
+      const tabs = ['materials','practice','study-guides','study-plan','history'];
+      const tabLabels = { materials: 'Materials', practice: 'Practice', 'study-guides': 'Study Guides', 'study-plan': 'Study Plan', history: 'History' };
       return '<div class="main">' +
         '<h2 style="margin-bottom:4px;font-size:24px;">' + cls.name + '</h2>' +
         '<p style="color:var(--text2);margin-bottom:20px;font-size:14px;">' + state.materials.length + ' material' + (state.materials.length !== 1 ? 's' : '') + ' uploaded</p>' +
-        '<div class="tabs">' + ['materials','practice','study-guides','history'].map(t =>
-          '<button class="tab ' + (state.currentTab === t ? 'active' : '') + '" data-tab="' + t + '">' +
-          (t === 'materials' ? 'Materials' : t === 'practice' ? 'Practice' : t === 'study-guides' ? 'Study Guides' : 'History') + '</button>'
+        '<div class="tabs">' + tabs.map(t =>
+          '<button class="tab ' + (state.currentTab === t ? 'active' : '') + '" data-tab="' + t + '">' + tabLabels[t] + '</button>'
         ).join('') + '</div>' +
         (state.loading ? '<div class="loading"><div class="spinner"></div>' + state.loadingMsg + '</div>' : renderTabContent()) +
         '</div>';
@@ -620,6 +814,7 @@ const HTML = `<!DOCTYPE html>
         case 'materials': return renderMaterials();
         case 'practice': return renderPractice();
         case 'study-guides': return renderStudyGuides();
+        case 'study-plan': return renderStudyPlan();
         case 'history': return renderHistory();
         default: return '';
       }
@@ -627,14 +822,17 @@ const HTML = `<!DOCTYPE html>
 
     function renderMaterials() {
       return '<div class="card"><h2>Upload Study Material</h2>' +
-        '<p style="color:var(--text2);font-size:13px;margin-bottom:16px;">Paste notes, upload files, or enter content directly. This becomes the source for generating questions and study guides.</p>' +
+        '<p style="color:var(--text2);font-size:13px;margin-bottom:16px;">Paste notes, upload files (PDF, images, text), or enter content directly.</p>' +
         '<div class="form-group"><label>Title</label><input type="text" id="mat-title" placeholder="e.g., Chapter 5 Notes, Lab 3 Data..."></div>' +
         '<div class="form-group"><label>Content (paste notes, text, etc.)</label><textarea id="mat-content" placeholder="Paste your notes, textbook excerpts, lecture content..." rows="6"></textarea></div>' +
-        '<div class="form-group"><label>Or upload a file (PDF, TXT, MD, etc.)</label><input type="file" id="mat-file" accept=".txt,.md,.csv,.json,.html,.pdf"></div>' +
+        '<div class="form-group"><label>Upload a file (PDF, TXT, MD, images)</label><input type="file" id="mat-file" accept=".txt,.md,.csv,.json,.html,.pdf,.png,.jpg,.jpeg,.gif,.webp"></div>' +
+        '<div class="form-group"><label>Upload images (select multiple)</label><input type="file" id="mat-images" accept="image/*" multiple></div>' +
         '<button class="btn btn-primary" onclick="uploadMaterial()">Upload Material</button></div>' +
         (state.materials.length ?
           '<div class="card"><h2>Uploaded Materials</h2>' + state.materials.map(m =>
-            '<div class="material-item"><div><div class="name">' + esc(m.title) + '</div><div class="meta">' +
+            '<div class="material-item"><div><div class="name">' + esc(m.title) +
+            (m.has_images ? ' <span class="badge badge-img">IMG</span>' : '') +
+            '</div><div class="meta">' +
             (m.file_name ? m.file_name + ' \\u00b7 ' : '') + new Date(m.created_at).toLocaleDateString() +
             '</div></div><button class="btn btn-danger" onclick="deleteMaterial(\\'' + m.id + '\\')">Delete</button></div>'
           ).join('') + '</div>'
@@ -646,7 +844,8 @@ const HTML = `<!DOCTYPE html>
       if (state.materials.length === 0) return '<div class="card"><h2>Generate Practice Questions</h2><p style="color:var(--text2);font-size:14px;">Upload materials first, then come back to generate questions.</p></div>';
       return '<div class="card"><h2>Generate Practice Questions</h2>' +
         '<h3>Select materials to use (or leave unchecked to use all)</h3>' +
-        state.materials.map(m => '<label class="material-check"><input type="checkbox" class="mat-select" value="' + m.id + '">' + esc(m.title) + '</label>').join('') +
+        state.materials.map(m => '<label class="material-check"><input type="checkbox" class="mat-select" value="' + m.id + '">' + esc(m.title) +
+          (m.has_images ? ' <span class="badge badge-img">IMG</span>' : '') + '</label>').join('') +
         '<div style="margin-top:20px;"><h3>Multiple Choice</h3><div class="gen-row"><div class="form-group"><label># Questions</label>' +
         '<select id="mcq-count"><option value="5">5</option><option value="10">10</option><option value="15">15</option><option value="20">20</option></select></div>' +
         '<button class="btn btn-primary" onclick="generateMCQ()">Generate MCQ</button></div></div>' +
@@ -656,23 +855,19 @@ const HTML = `<!DOCTYPE html>
     }
 
     function renderMCQQuiz() {
-      const qs = state.quizQuestions;
-      let score = 0;
+      const qs = state.quizQuestions; let score = 0;
       if (state.quizSubmitted) qs.forEach((q, i) => { if (state.quizAnswers[i] === q.answer) score++; });
       return (state.quizSubmitted ? '<div class="score-banner"><div class="score-big">' + score + ' / ' + qs.length + '</div><div class="score-label">' + Math.round(score/qs.length*100) + '% correct</div></div>' : '') +
         qs.map((q, i) => {
-          const selected = state.quizAnswers[i];
-          const submitted = state.quizSubmitted;
+          const selected = state.quizAnswers[i]; const submitted = state.quizSubmitted;
           return '<div class="question-card"><div class="question-num">Question ' + (i+1) + '</div><div class="question-text">' + esc(q.question) + '</div>' +
             q.options.map(opt => {
-              const letter = opt.charAt(0);
-              let cls = 'option';
+              const letter = opt.charAt(0); let cls = 'option';
               if (submitted) { if (letter === q.answer) cls += ' correct'; else if (letter === selected) cls += ' incorrect'; }
               else if (letter === selected) cls += ' selected';
               return '<div class="' + cls + '" data-q="' + i + '" data-a="' + letter + '">' + esc(opt) + '</div>';
             }).join('') +
-            (submitted ? '<div class="explanation"><strong>Answer: ' + q.answer + '</strong> \\u2014 ' + esc(q.explanation) + '</div>' : '') +
-            '</div>';
+            (submitted ? '<div class="explanation"><strong>Answer: ' + q.answer + '</strong> \\u2014 ' + esc(q.explanation) + '</div>' : '') + '</div>';
         }).join('') +
         '<div style="display:flex;gap:10px;margin-top:10px;">' +
         (!state.quizSubmitted ? '<button class="btn btn-primary" onclick="submitMCQ()">Submit Answers</button>' : '') +
@@ -717,6 +912,57 @@ const HTML = `<!DOCTYPE html>
           ).join('') + '</div>' : '');
     }
 
+    function renderStudyPlan() {
+      if (state.viewingPlan) return renderPlanDetail(state.viewingPlan);
+
+      return '<div class="card"><h2>Create a Study Plan</h2>' +
+        '<p style="color:var(--text2);font-size:13px;margin-bottom:16px;">Tell me what you want to study and how long you have. I\\'ll create a structured plan with steps you can check off.</p>' +
+        '<div class="form-group"><label>Study Goal</label><textarea id="plan-goal" placeholder="e.g., Master integration techniques for the AP Calc BC exam, Review all acid-base chemistry concepts..." rows="3"></textarea></div>' +
+        '<div class="gen-row">' +
+        '<div class="form-group"><label>Duration</label><input type="text" id="plan-duration" placeholder="e.g., 3 days, 1 week, 2 hours"></div>' +
+        '<div class="form-group"><label>Exam/Due Date (optional)</label><input type="date" id="plan-exam"></div>' +
+        '</div>' +
+        '<button class="btn btn-primary" onclick="createPlan()" style="margin-top:16px;">Create Study Plan</button></div>' +
+        (state.plans.length ? '<div class="card"><h2>Your Study Plans</h2>' +
+          state.plans.map(p => {
+            const done = (p.steps || []).filter(s => s.completed).length;
+            const total = (p.steps || []).length;
+            const pct = total > 0 ? Math.round(done/total*100) : 0;
+            return '<div class="saved-item" data-plan-id="' + p.id + '"><div class="info"><div class="title">' + esc(p.title) + '</div>' +
+              '<div class="date">' + done + '/' + total + ' steps done (' + pct + '%) \\u00b7 ' + new Date(p.created_at).toLocaleDateString() + '</div></div>' +
+              '<button class="btn btn-danger" onclick="event.stopPropagation();deletePlan(\\'' + p.id + '\\')">Delete</button></div>';
+          }).join('') + '</div>' : '');
+    }
+
+    function renderPlanDetail(plan) {
+      const done = plan.steps.filter(s => s.completed).length;
+      const total = plan.steps.length;
+      const pct = total > 0 ? Math.round(done/total*100) : 0;
+
+      return '<button class="btn btn-secondary" onclick="state.viewingPlan=null;render();" style="margin-bottom:16px;">Back to Plans</button>' +
+        '<div class="card"><h2>' + esc(plan.title) + '</h2>' +
+        '<p style="color:var(--text2);font-size:14px;margin-bottom:4px;">' + esc(plan.goal) + '</p>' +
+        '<p style="color:var(--text2);font-size:13px;">Duration: ' + esc(plan.duration) +
+        (plan.exam_date ? ' \\u00b7 Exam: ' + plan.exam_date : '') + '</p>' +
+        '<div style="margin:16px 0;"><p style="font-size:13px;color:var(--text2);margin-bottom:4px;">' + done + ' of ' + total + ' steps complete (' + pct + '%)</p>' +
+        '<div class="plan-progress"><div class="plan-progress-bar" style="width:' + pct + '%"></div></div></div>' +
+        (plan.summary ? '<p style="font-size:14px;margin-bottom:16px;">' + esc(plan.summary) + '</p>' : '') +
+        plan.steps.map(s =>
+          '<div class="plan-step ' + (s.completed ? 'completed' : '') + '">' +
+          '<div class="step-check" data-plan="' + plan.id + '" data-step="' + s.id + '" data-done="' + (s.completed ? '1' : '0') + '">' +
+          (s.completed ? '\\u2713' : '') + '</div>' +
+          '<div class="step-body"><div class="step-day">' + esc(s.day) +
+          '<span class="step-type type-' + (s.type || 'review') + '">' + esc(s.type || 'review') + '</span></div>' +
+          '<div class="step-title">' + esc(s.title) + '</div>' +
+          '<div class="step-desc">' + esc(s.description) + '</div>' +
+          (s.duration ? '<span class="step-dur">\\u23f1 ' + esc(s.duration) + '</span>' : '') +
+          '</div></div>'
+        ).join('') +
+        (plan.tips && plan.tips.length ? '<div class="plan-tips"><h4>Tips</h4><ul>' +
+          plan.tips.map(t => '<li>' + esc(t) + '</li>').join('') + '</ul></div>' : '') +
+        '</div>';
+    }
+
     function renderHistory() {
       const mcqs = state.questions.filter(q => q.type === 'mcq');
       const frqs = state.questions.filter(q => q.type === 'frq');
@@ -741,8 +987,7 @@ const HTML = `<!DOCTYPE html>
       document.querySelectorAll('.option[data-q]').forEach(el => {
         el.addEventListener('click', () => {
           if (state.quizSubmitted) return;
-          state.quizAnswers[parseInt(el.dataset.q)] = el.dataset.a;
-          render();
+          state.quizAnswers[parseInt(el.dataset.q)] = el.dataset.a; render();
         });
       });
       document.querySelectorAll('[data-guide-id]').forEach(el => {
@@ -751,12 +996,26 @@ const HTML = `<!DOCTYPE html>
           if (g) viewGuide(g);
         });
       });
+      document.querySelectorAll('[data-plan-id]').forEach(el => {
+        el.addEventListener('click', () => {
+          const p = state.plans.find(p => p.id === el.dataset.planId);
+          if (p) viewPlan(p);
+        });
+      });
+      document.querySelectorAll('.step-check').forEach(el => {
+        el.addEventListener('click', () => {
+          const planId = el.dataset.plan;
+          const stepId = parseInt(el.dataset.step);
+          const isDone = el.dataset.done === '1';
+          toggleStep(planId, stepId, !isDone);
+        });
+      });
     }
 
     function esc(str) {
       if (!str) return '';
       const div = document.createElement('div');
-      div.textContent = str;
+      div.textContent = String(str);
       return div.innerHTML;
     }
 
