@@ -1,7 +1,7 @@
 import { Hono } from "https://deno.land/x/hono@v4.3.6/mod.ts";
 import { cors } from "https://deno.land/x/hono@v4.3.6/middleware/cors/index.ts";
 import Anthropic from "npm:@anthropic-ai/sdk";
-import { extractText } from "npm:unpdf@0.12.1";
+// PDF parsing moved to client-side for speed
 
 const app = new Hono();
 const kv = await Deno.openKv();
@@ -83,10 +83,7 @@ app.post("/api/classes/:id/materials", async (c) => {
     const uint8 = new Uint8Array(arrayBuffer);
     const ext = file.name.toLowerCase().split('.').pop();
 
-    if (ext === 'pdf') {
-      const result = await extractText(uint8);
-      content = String(result.text || "");
-    } else if (['png', 'jpg', 'jpeg', 'gif', 'webp'].includes(ext || '')) {
+    if (['png', 'jpg', 'jpeg', 'gif', 'webp'].includes(ext || '')) {
       // Store image as base64
       const base64 = btoa(String.fromCharCode(...uint8));
       const mimeType = ext === 'jpg' ? 'image/jpeg' : `image/${ext}`;
@@ -610,6 +607,23 @@ const HTML = `<!DOCTYPE html>
 <body>
   <div class="app" id="app"></div>
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.0.379/pdf.min.mjs" type="module"></script>
+  <script>
+    // PDF text extraction (client-side)
+    async function extractPdfText(file) {
+      const pdfjsLib = await import('https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.0.379/pdf.min.mjs');
+      pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.0.379/pdf.worker.min.mjs';
+      const arrayBuffer = await file.arrayBuffer();
+      const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+      let text = '';
+      for (let i = 1; i <= pdf.numPages; i++) {
+        const page = await pdf.getPage(i);
+        const content = await page.getTextContent();
+        text += content.items.map(item => item.str).join(' ') + '\\n';
+      }
+      return text;
+    }
+  </script>
   <script>
     const API = '';
     let state = {
@@ -656,7 +670,7 @@ const HTML = `<!DOCTYPE html>
 
     async function uploadMaterial() {
       const title = document.getElementById('mat-title').value.trim();
-      const content = document.getElementById('mat-content').value.trim();
+      let content = document.getElementById('mat-content').value.trim();
       const fileInput = document.getElementById('mat-file');
       const imageInput = document.getElementById('mat-images');
       const file = fileInput?.files?.[0];
@@ -666,13 +680,26 @@ const HTML = `<!DOCTYPE html>
         alert('Please provide a title and content, a file, or images'); return;
       }
 
+      state.loading = true; state.loadingMsg = 'Processing...'; render();
+
+      // Extract PDF text client-side
+      let fileToUpload = file;
+      if (file && file.name.toLowerCase().endsWith('.pdf')) {
+        state.loadingMsg = 'Extracting text from PDF...'; render();
+        try {
+          const pdfText = await extractPdfText(file);
+          content = pdfText;
+          fileToUpload = null; // Don't send the PDF file, just the text
+        } catch(e) { console.error('PDF extraction failed:', e); }
+      }
+
       const form = new FormData();
       form.append('title', title || (file ? file.name : (images?.length ? 'Image Upload' : 'Untitled')));
       if (content) form.append('content', content);
-      if (file) form.append('file', file);
+      if (fileToUpload) form.append('file', fileToUpload);
       if (images) { for (const img of images) form.append('images', img); }
 
-      state.loading = true; state.loadingMsg = 'Uploading...'; render();
+      state.loadingMsg = 'Uploading...'; render();
       await api('/api/classes/' + state.currentClass.id + '/materials', { method: 'POST', body: form });
       state.loading = false;
       await loadClassData();
