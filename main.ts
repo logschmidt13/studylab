@@ -611,7 +611,6 @@ const HTML = `<!DOCTYPE html>
 <body>
   <div class="app" id="app"></div>
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.0.379/pdf.min.mjs" type="module"></script>
   <script>
     // PDF text extraction (client-side) with progress + chunking
     async function extractPdfPages(file, onProgress) {
@@ -635,18 +634,17 @@ const HTML = `<!DOCTYPE html>
       for (let i = 0; i < pages.length; i++) {
         const pageLen = pages[i].length;
         if (currentLen + pageLen > maxChars && current.length > 0) {
-          chunks.push({ text: current.join('\n'), startPage, endPage: i });
+          chunks.push({ text: current.join('\\n'), startPage, endPage: i });
           current = []; currentLen = 0; startPage = i + 1;
         }
         current.push(pages[i]); currentLen += pageLen;
       }
       if (current.length > 0) {
-        chunks.push({ text: current.join('\n'), startPage, endPage: pages.length });
+        chunks.push({ text: current.join('\\n'), startPage, endPage: pages.length });
       }
       return chunks;
     }
-  </script>
-  <script>
+
     const API = '';
     let state = {
       classes: [], currentClass: null, currentTab: 'materials',
