@@ -620,11 +620,16 @@ const HTML = `<!DOCTYPE html>
 <body>
   <div class="app" id="app"></div>
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <script type="module">
+    import * as pdfjsLib from 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.0.379/pdf.min.mjs';
+    pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.0.379/pdf.worker.min.mjs';
+    window._pdfjsLib = pdfjsLib;
+  </script>
   <script>
     // PDF text extraction (client-side) with progress + chunking
     async function extractPdfPages(file, onProgress) {
-      const pdfjsLib = await import('https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.0.379/pdf.min.mjs');
-      pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.0.379/pdf.worker.min.mjs';
+      var pdfjsLib = window._pdfjsLib;
+      if (!pdfjsLib) { throw new Error('PDF.js not loaded yet. Please try again.'); }
       const arrayBuffer = await file.arrayBuffer();
       const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
       const pages = [];
