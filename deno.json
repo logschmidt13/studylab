@@ -1,0 +1,11 @@
+{
+  "tasks": {
+    "dev": "deno run --allow-net --allow-read --allow-write --allow-env --allow-ffi --env --watch main.ts",
+    "start": "deno run --allow-net --allow-read --allow-write --allow-env --allow-ffi --env main.ts"
+  },
+  "imports": {
+    "hono": "https://deno.land/x/hono@v4.3.6/mod.ts",
+    "hono/": "https://deno.land/x/hono@v4.3.6/",
+    "@anthropic-ai/sdk": "npm:@anthropic-ai/sdk@latest"
+  }
+}
